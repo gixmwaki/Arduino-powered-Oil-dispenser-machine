@@ -1,0 +1,371 @@
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+
+// Define LCD properties
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Define keypad properties
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+byte rowPins[ROWS] = {9, 8, 7, 6};
+byte colPins[COLS] = {5, 4, 3, 2};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// Define pins for buttons
+const int button1Pin = 12; // Toggles between KSH and volume mode
+const int button2Pin = 13; // Starts/stops dispensing
+
+// Define pins for components
+const int pumpPin = 11;
+const int solenoidPin = 10;
+const int ledPin = 14;
+
+// Constants
+float pricePerLiter = 230.0; // Price per liter in KSH
+const float pumpFlowRate = 1000.0 / 30.0; // 1000ml in 30 seconds
+
+// Global variables
+bool loggedIn = false;
+bool modeKsh = true; // KSH mode by default
+bool dispensing = false;
+bool stopDispense = false;
+float dispenseVolume = 0.0;
+unsigned long dispenseStartTime = 0;
+float dispenseTime = 0.0;
+int passcode[] = {1, 2, 3, 4}; // Default passcode
+int passcodeInput[4];
+const int passcodeLength = 4;
+int passcodeIndex = 0;
+
+void setup() {
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Welcome Back");
+  lcd.setCursor(0, 1);
+  lcd.print("Enter Passcode:");
+
+  // Initialize buttons
+  pinMode(button1Pin, INPUT_PULLUP);
+  pinMode(button2Pin, INPUT_PULLUP);
+
+  // Initialize components
+  pinMode(pumpPin, OUTPUT);
+  pinMode(solenoidPin, OUTPUT);
+  pinMode(ledPin, OUTPUT);
+}
+
+void loop() {
+  if (!loggedIn) {
+    handleLogin();
+  } else {
+    handleMenuAndDispensing();
+  }
+}
+
+void handleLogin() {
+  char key = keypad.getKey();
+  if (key) {
+    if (key >= '0' && key <= '9') { // Numeric keys for passcode input
+      passcodeInput[passcodeIndex++] = key - '0';
+      lcd.setCursor(passcodeIndex - 1, 1);
+      lcd.print('*');
+      if (passcodeIndex == 4) {
+        if (checkPasscode()) {
+          loggedIn = true;
+          lcd.clear();
+          lcd.print("Access Granted!");
+          delay(2000);
+          lcd.clear();
+          showMainMenu();
+        } else {
+          lcd.clear();
+          lcd.print("Access Denied!");
+          delay(1500);
+          lcd.clear();
+          passcodeIndex = 0;
+          lcd.setCursor(0, 0);
+          lcd.print("Welcome Back");
+          lcd.setCursor(0, 1);
+          lcd.print("Enter Passcode:");
+        }
+      }
+    }
+  }
+}
+
+bool checkPasscode() {
+  for (int i = 0; i < 4; i++) {
+    if (passcodeInput[i] != passcode[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void showMainMenu() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  if (modeKsh) {
+    lcd.print("Mode: KSH");
+    lcd.setCursor(0, 1);
+    lcd.print("Enter in Ksh");
+  } else {
+    lcd.print("Mode: Volume");
+    lcd.setCursor(0, 1);
+    lcd.print("Enter in ML");
+  }
+  
+}
+
+
+
+void toggleMode() {
+  int buttonState = digitalRead(button1Pin); // Read the state of the button
+  
+  // Check if the button is pressed
+  if (buttonState == LOW) {
+    if (promptCurrentPassword()) { // Check if password is correct
+      modeKsh = !modeKsh;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      if (modeKsh) {
+        lcd.print("Mode: KSH");
+      } else {
+        lcd.print("Mode: Volume");
+      }
+      delay(1000);
+      lcd.clear();
+    }
+  }
+}
+
+void handleMenuAndDispensing() {
+  // Check button1Pin press to toggle mode
+  int button1State = digitalRead(button1Pin);
+  if (button1State == LOW) {
+    toggleMode();
+    showMainMenu();
+    delay(200); // Debouncing delay
+  }
+
+  // Check button2Pin press to start/stop dispensing
+  int button2State = digitalRead(button2Pin);
+  if (button2State == LOW) {
+    if (!dispensing) {
+      if (modeKsh) {
+        // Start dispensing in KSH mode
+        startDispensingKsh();
+      } else {
+        // Start dispensing in volume mode
+        startDispensingVolume();
+      }
+    } else {
+      // Stop dispensing
+      stopDispensing();
+    }
+    delay(200); // Debouncing delay
+  }
+
+  // Check for long press of keys to perform actions
+  char key = keypad.getKey();
+  if (key) {
+    unsigned long startTime = millis();
+    while (keypad.getKey() == key) {
+      // Wait for key release
+      if (millis() - startTime > 3000) { // Long press duration (3 seconds)
+        // Long press detected
+        switch (key) {
+          case 'A':
+            if (passwordEntered) {
+              changePricePerLiter();
+            }
+            break;
+          case 'B':
+            if (passwordEntered) {
+              showStoredData();
+            }
+            break;
+          case 'C':
+            if (passwordEntered) {
+              deleteStoredData();
+            }
+            break;
+          case 'D':
+            if (passwordEntered) {
+              changePassword();
+            }
+            break;
+          default:
+            break;
+        }
+        break;
+      }
+    }
+  }   
+
+  // Handle dispensing process
+  if (dispensing) {
+    dispense();
+  }
+}
+
+void startDispensingKsh() {
+  // Calculate dispense time based on the price per liter
+  dispenseTime = (dispenseVolume / pricePerLiter) * 60.0; // Convert to seconds
+  // Activate pump and solenoid valve
+  digitalWrite(pumpPin, HIGH);
+  digitalWrite(solenoidPin, HIGH);
+  digitalWrite(ledPin, HIGH);
+  // Set dispensing flag and start time
+  dispensing = true;
+  dispenseStartTime = millis();
+}
+
+void startDispensingVolume() {
+  // Calculate dispense time based on the specified volume and pump flow rate
+  dispenseTime = dispenseVolume / pumpFlowRate; // in seconds
+  // Activate pump and solenoid valve
+  digitalWrite(pumpPin, HIGH);
+  digitalWrite(solenoidPin, HIGH);
+  digitalWrite(ledPin, HIGH);
+  // Set dispensing flag and start time
+  dispensing = true;
+  dispenseStartTime = millis();
+}
+
+void stopDispensing() {
+  // Deactivate pump and solenoid valve
+  digitalWrite(pumpPin, LOW);
+  digitalWrite(solenoidPin, LOW);
+  digitalWrite(ledPin, LOW);
+  // Reset dispensing flags
+  dispensing = false;
+  stopDispense = false;
+}
+
+void dispense() {
+  if (!stopDispense) {
+    unsigned long currentTime = millis();
+    float elapsedTime = (currentTime - dispenseStartTime) / 1000.0;
+    float remainingTime = dispenseTime - elapsedTime;
+    if (remainingTime <= 0) {
+      stopDispensing();
+      lcd.clear();
+      if (modeKsh) {
+        // Calculate the amount dispensed in KSH
+        float dispensedAmount = (dispenseVolume / 1000.0) * pricePerLiter; // Convert from mL to L
+        lcd.print("Dispensed: KSH ");
+        lcd.print(dispensedAmount);
+      } else {
+        // Display the dispensed volume in liters
+        lcd.print("Dispensed: Liter ");
+        lcd.print(dispenseVolume / 1000.0);
+             }
+      delay(2000);
+      lcd.clear();
+    } 
+      else {
+      lcd.setCursor(0, 1);
+      lcd.print("Time Left: ");
+      lcd.print(remainingTime, 1);
+      lcd.print("sec");
+    }
+  }
+}
+
+void changePricePerLiter() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Enter new price:");
+  
+  float newPrice = 0.0;
+  bool decimalEntered = false;
+  char inputBuffer[6]; // Buffer to hold the input digits (including '.')
+
+  int index = 0;
+  while (index < 6) {
+    char key = keypad.getKey();
+    if (key) {
+      if (isDigit(key)) {
+        inputBuffer[index++] = key;
+        lcd.print(key);
+      } else if (key == '.' && !decimalEntered) {
+        inputBuffer[index++] = key;
+        lcd.print(key);
+        decimalEntered = true;
+      } else if (key == '#') {
+        break; // Exit loop if '#' is pressed
+      }
+    }
+  }
+
+  newPrice = atof(inputBuffer);
+  pricePerLiter = newPrice;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Price changed");
+  delay(1000);
+  lcd.clear();
+}
+
+void changePasscode() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Enter new passcode:");
+  
+  char newPasscode[passcodeLength];
+  int index = 0;
+  while (index < passcodeLength) {
+    char key = keypad.getKey();
+    if (key) {
+      if (isDigit(key)) {
+        newPasscode[index++] = key;
+        lcd.setCursor(index, 1);
+        lcd.print("*");
+      } else if (key == '#') {
+        break; // Exit loop if '#' is pressed
+      }
+    }
+  }
+  
+  strncpy(passcode, newPasscode, passcodeLength);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Passcode changed");
+  delay(1000);
+  lcd.clear();
+}
+
+void clearScreen() {
+  lcd.clear();
+}
+
+void askForPassword() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Password required");
+  delay(1000);
+  handleLogin();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
